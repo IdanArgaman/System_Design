@@ -16,3 +16,11 @@ Interview-ready system design write-ups, converted and expanded from `System Des
 | 8 | [Real-Time Price Feed](designs/08-realtime-price-feed.md) | **Fixes a missing OHLC field** and a cache-key design flaw, consistent-hash fan-out, backpressure |
 
 Original source: [`System Design and Architecture.pptx`](System%20Design%20and%20Architecture.pptx).
+
+## Real-world systems
+
+Write-ups of actual systems (not interview practice) — same depth of component-by-component justification, scale/concurrency handling, and concrete improvements.
+
+| Design | Key ideas covered |
+|---|---|
+| [Optima — Hotel Channel Manager](designs/09-optima-channel-manager.md) | Why RabbitMQ over Kafka here specifically, the per-module `EXT` facade pattern, multi-tenant isolation, the adapter pattern for adding new OTA providers, transactional outbox fix for a dual-write gap |
