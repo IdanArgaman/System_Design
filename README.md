@@ -17,6 +17,14 @@ Interview-ready system design write-ups, converted and expanded from `System Des
 
 Original source: [`System Design and Architecture.pptx`](System%20Design%20and%20Architecture.pptx).
 
+## Concept deep-dives
+
+Standalone explanations of recurring interview topics — not tied to one system design.
+
+| Design | Key ideas covered |
+|---|---|
+| [Interview Concept Deep-Dives](designs/10-interview-concepts-deep-dive.md) | Atomicity/ACID, CQRS, Command vs. Strategy pattern, TCP statefulness, **Kafka internals** (partitions, throughput, offset storage), **RabbitMQ internals** (exchanges, AMQP), Kafka vs. RabbitMQ, outbox pattern, adapter pattern, plus CAP theorem, saga, circuit breaker, consistent hashing, rate limiting, single source of truth, and more |
+
 ## Real-world systems
 
 Write-ups of actual systems (not interview practice) — same depth of component-by-component justification, scale/concurrency handling, and concrete improvements.
