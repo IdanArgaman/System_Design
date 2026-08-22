@@ -1,6 +1,6 @@
 # Interview Concept Deep-Dives
 
-> Standalone explanations of recurring system-design interview topics — expanded from a real interview's question list (atomicity, CQRS, Command vs. Strategy pattern, whether TCP/IP is stateful) plus Kafka and RabbitMQ internals, and a set of adjacent patterns worth knowing cold (outbox, adapter, saga, circuit breaker, CAP theorem, consistent hashing, rate limiting, delivery semantics). Each section ends with a quick-fire Q&A bank you can use to drill yourself.
+> Standalone explanations of recurring system-design interview topics — expanded from a real interview's question list (atomicity, CQRS, Command vs. Strategy pattern, whether TCP/IP is stateful) plus Kafka and RabbitMQ internals, gRPC, and a set of adjacent patterns worth knowing cold (outbox, adapter, saga, circuit breaker, CAP theorem, consistent hashing, rate limiting, delivery semantics). Each section ends with a quick-fire Q&A bank you can use to drill yourself.
 
 ## Table of contents
 
@@ -14,7 +14,8 @@
 8. [Outbox Pattern](#8-outbox-pattern)
 9. [Adapter Pattern](#9-adapter-pattern)
 10. [Bonus patterns worth knowing](#10-bonus-patterns-worth-knowing)
-11. [Consolidated quick-fire question bank](#11-consolidated-quick-fire-question-bank)
+11. [gRPC](#11-grpc)
+12. [Consolidated quick-fire question bank](#12-consolidated-quick-fire-question-bank)
 
 ---
 
@@ -436,13 +437,70 @@ flowchart LR
 
 - Each partition has one **leader** replica (handles all reads/writes for that partition) and **N follower** replicas on other brokers, purely for durability/failover — followers don't serve client traffic directly.
 - The **ISR (In-Sync Replica) set** is the subset of replicas that are fully caught up with the leader. If the leader dies, a new leader is elected from the ISR — this is why staying "in sync" matters: a follower that's fallen too far behind gets dropped from the ISR and can't be safely promoted.
-- Producer durability is tunable via **`acks`**: `acks=0` (fire and forget, fastest, can lose data), `acks=1` (leader persisted it, still at risk if leader dies before followers replicate), `acks=all`/`-1` (all in-sync replicas have it — strongest durability, highest latency). This is a direct, concrete throughput-vs-durability knob and a favorite interview question.
+- acks (acknowledgments) parameter configures how many broker confirmations a producer must wait for before considering a message write successful. It controls the trade-off between write speed (throughput) and data safety (durability).
+
+| Setting | Behavior | Pros | Cons |
+|---|---|---|---|
+| **acks=0** (No Wait) | The producer sends a message and assumes it is delivered immediately, without waiting for any response from the broker. | Highest throughput and lowest latency. | Zero delivery guarantees; if the network drops or the broker crashes, the data is lost permanently. |
+| **acks=1** (Leader Wait) | The producer waits until the partition's leader broker writes the message to its local log. | Decent speed with basic reliability. | If the leader crashes right after writing the message — before follower replicas copy it — the message is lost. |
+| **acks=all** / **acks=-1** (All Replicas Wait) | The producer waits until all current In-Sync Replicas (ISRs) acknowledge the record. | Strongest durability; data survives individual broker crashes as long as at least one replica is active. | Higher latency because it requires network round-trips to multiple servers. |
 
 ### 5.6 Delivery semantics / exactly-once
 
 - Kafka is **at-least-once** by default (a producer retry after an ambiguous failure can duplicate a message; a consumer that crashes after processing but before committing its offset will re-read on restart) — consumers should be **idempotent** to handle this safely (compare to the idempotency discussion in [§10.4](#104-idempotency--message-delivery-semantics)).
 - **Idempotent producer** (`enable.idempotence=true`): the producer tags each message with a producer ID + sequence number, and the broker dedupes retries of the *same* message within a partition — solves accidental duplication from producer-side retries.
 - **Transactions**: let a producer write to multiple partitions/topics atomically and have consumers (with `isolation.level=read_committed`) only see the writes if the transaction committed — this is what gets you true **exactly-once** semantics for Kafka-to-Kafka pipelines (e.g., Kafka Streams). It does not extend exactly-once to an external side effect (e.g., an HTTP call) — that still needs idempotency or the outbox pattern.
+
+#### 5.6.1 Producer retries & ambiguous failures
+
+When a producer pushes a message to a broker, it waits for an **ack** (see [§5.5](#55-replication--durability)) to confirm the write. An *ambiguous failure* happens when a network glitch or broker crash interrupts that handshake **after** the broker has durably written the message but **before** the ack makes it back to the producer:
+
+```mermaid
+sequenceDiagram
+    participant Producer
+    participant Broker
+
+    Producer->>Broker: Send "Message A"
+    Broker->>Broker: Write to log (success)
+    Broker--xProducer: Ack lost (network drop / timeout)
+    Note over Producer: No ack received —<br/>treats the send as failed
+    Producer->>Broker: Retry "Message A"
+    Broker->>Broker: Write to log again
+    Note over Broker: "Message A" now appears<br/>twice in the partition log
+```
+
+The producer can't distinguish "my message never arrived" from "my message arrived but the ack didn't" — so the default, safe assumption is to retry, which is what makes duplication possible on the write path.
+
+#### 5.6.2 Consumer commits & crash scenarios
+
+Kafka doesn't track which individual messages a consumer has read; it tracks an **offset** — the sequential ID of the next message to read — per group, in the internal `__consumer_offsets` topic. In an at-least-once setup, a consumer reads a message, processes it, and only then commits the new offset back to Kafka:
+
+```mermaid
+sequenceDiagram
+    participant Kafka
+    participant Consumer
+
+    Kafka->>Consumer: Deliver message (offset 10)
+    Consumer->>Consumer: Process message (e.g., write to DB)
+    Note over Consumer: 💥 App crashes here —<br/>before the offset commit
+    Consumer--xKafka: Commit offset 11 (never sent)
+
+    Note over Consumer: Consumer restarts
+    Consumer->>Kafka: Fetch last committed offset
+    Kafka->>Consumer: Offset 10 (unchanged)
+    Kafka->>Consumer: Re-deliver message (offset 10)
+    Note over Consumer: Same message processed a second time
+```
+
+Because Kafka still believes the consumer is sitting at offset 10, a restart re-delivers a message that was already fully processed.
+
+#### 5.6.3 The defense: idempotent consumers
+
+Since duplicates can originate on either side — producer retries ([§5.6.1](#561-producer-retries--ambiguous-failures)) or consumer re-reads ([§5.6.2](#562-consumer-commits--crash-scenarios)) — the reliable fix is to make the consumer's processing **idempotent**: applying it N times has the same effect as applying it once (see also the idempotency discussion in [§10.4](#104-idempotency--message-delivery-semantics)). Common patterns:
+
+- **Unique database constraints**: a primary key or unique index on a business ID carried in the message (e.g., `order_id`). A duplicate write is safely rejected by the constraint instead of double-applied.
+- **Idempotency keys (deduplication layer)**: track recently processed message IDs in a fast store (e.g., Redis). Check before processing; if the ID's already there, skip it.
+- **Upserts (natural idempotence)**: model changes as state overwrites rather than increments — `SET status = 'COMPLETED'` gives the same result no matter how many times it runs, whereas `balance += 100` corrupts the ledger on a replay.
 
 ### 5.7 Practical example — a sensor-readings pipeline, end to end
 
@@ -977,6 +1035,8 @@ flowchart LR
 - **Orchestration**: a central orchestrator explicitly calls each step and issues compensations on failure — flow is explicit/traceable, at the cost of a central component to build and own.
 - Every step (forward and compensating) must be **idempotent** — a saga replays/retries under failure, same as any at-least-once system.
 
+For more details, see [11-saga-pattern-in-depth.md](./11-saga-pattern-in-depth.md).
+
 ### 10.3 Circuit breaker
 
 Protects a caller from repeatedly hammering a failing downstream dependency, and gives that dependency room to recover.
@@ -1078,7 +1138,182 @@ flowchart TD
 
 ---
 
-## 11. Consolidated quick-fire question bank
+## 11. gRPC
+
+### 11.1 What gRPC actually is
+
+**gRPC** ("gRPC Remote Procedure Calls") is an RPC framework: it lets a client call a method on a remote server as if it were a local function call, with the network hop, serialization, and transport handled transparently by generated code. Three pieces make this work, and naming them precisely is what separates a vague answer from a solid one:
+
+- **Protocol Buffers (protobuf)** — the interface definition language (IDL) *and* the binary wire format. You write a `.proto` file describing **services** (RPC methods) and **messages** (typed data structures); the `protoc` compiler generates client-stub and server-skeleton code in dozens of languages from that one file.
+- **HTTP/2** — the transport gRPC is built on, and *mandatory*, not optional. This is a real departure from REST, which is nominally transport-agnostic but in practice mostly rides HTTP/1.1.
+- **Generated stubs** — client-side code that makes a remote call look like `client.getUser(request)`, and server-side code that dispatches an incoming call to your handler implementation. Both are generated from the *same* `.proto`, so client and server can never drift out of sync about the contract the way a hand-maintained REST client and a hand-maintained REST server can.
+
+### 11.2 Architecture
+
+```mermaid
+flowchart LR
+    Proto[[".proto file<br/>service + message defs"]] -->|"protoc codegen"| ClientStub["Client stub<br/>(generated)"]
+    Proto -->|"protoc codegen"| ServerSkel["Server skeleton<br/>(generated)"]
+
+    App["Client app<br/>client.getUser(req)"] --> ClientStub
+    ClientStub -->|"serialize to protobuf<br/>+ HTTP/2 frame"| Wire[["HTTP/2 over TCP<br/>(TLS by default)"]]
+    Wire --> ServerSkel
+    ServerSkel -->|"deserialize + dispatch"| Impl["Your service impl<br/>getUser(req) { ... }"]
+    Impl -->|"response"| ServerSkel
+    ServerSkel -->|"serialize"| Wire
+    Wire -->|"deserialize"| ClientStub
+    ClientStub -->|"typed response object"| App
+```
+
+### 11.3 The four RPC shapes
+
+HTTP/2 streams are what make three of these four possible at all — plain request/response REST over HTTP/1.1 can't do bidirectional streaming without bolting on WebSockets/SSE separately.
+
+| RPC type | Shape | Example |
+|---|---|---|
+| **Unary** | 1 request → 1 response | `GetUser(id) -> User` — the REST-equivalent default. |
+| **Server streaming** | 1 request → stream of responses | `SubscribeToPriceUpdates(symbol) -> stream Price` — client opens one call, server pushes updates as they happen. |
+| **Client streaming** | stream of requests → 1 response | `UploadChunks(stream Chunk) -> UploadSummary` — client streams a large file in pieces, server acks once at the end. |
+| **Bidirectional streaming** | stream ↔ stream, independent | `Chat(stream Message) -> stream Message` — both sides send/receive on one long-lived connection, in any order/timing relative to each other. |
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant S as Server
+
+    Note over C,S: Bidirectional streaming — one HTTP/2 stream, both sides read/write independently
+    C->>S: open stream
+    C->>S: message 1
+    S->>C: message A
+    C->>S: message 2
+    S->>C: message B
+    S->>C: message C
+    C->>S: message 3
+    Note over C,S: Either side can close its half independently
+    C->>S: half-close (done sending)
+    S->>C: final message + status
+```
+
+```protobuf
+syntax = "proto3";
+
+service UserService {
+  rpc GetUser (GetUserRequest) returns (User);                     // unary
+  rpc SubscribeToUpdates (Subscription) returns (stream Event);     // server streaming
+  rpc UploadChunks (stream Chunk) returns (UploadSummary);          // client streaming
+  rpc Chat (stream Message) returns (stream Message);               // bidirectional streaming
+}
+
+message GetUserRequest { string user_id = 1; }
+message User { string user_id = 1; string name = 2; int32 age = 3; }
+```
+
+### 11.4 Protocol Buffers — wire format & schema evolution
+
+- **Binary, not text** — each field is encoded as a `(field_number, wire_type)` tag plus a value, using **varints** for small integers (variable-length encoding, so small numbers take fewer bytes). There are no field *names* on the wire at all — this is exactly why protobuf payloads are smaller than the equivalent JSON (no repeated `"userId":` string per message), and it's why the field **number**, not the name, is a field's actual identity on the wire.
+- Because the number is the wire identity, the evolution rules follow directly from that one fact:
+  - **Adding a field is safe** — old clients that don't recognize a new tag just skip it.
+  - **Renaming a field is safe** — the wire format never looks at the name.
+  - **Never reuse a retired field number** — old serialized messages may still carry data tagged with it; mark it `reserved` so it can't be accidentally reassigned to something unrelated later.
+- proto3 fields are optional-by-default (no `required` keyword) — a field simply absent on the wire is read back as its type's default value.
+
+### 11.5 Why gRPC beats REST + JSON for internal service-to-service calls
+
+The comparison interviewers are actually fishing for, almost always:
+
+| Dimension | gRPC | REST over HTTP/1.1 + JSON |
+|---|---|---|
+| Payload format | Binary protobuf — compact, no field names on the wire | Text JSON — human-readable but verbose |
+| Transport | HTTP/2 always — many streams multiplexed over one TCP connection | Usually HTTP/1.1 — effectively one request in flight per connection, so clients open several parallel connections per host to fake concurrency |
+| Contract | Strongly-typed `.proto`, codegen'd client + server — compile-time safety | Usually a loose convention; OpenAPI/Swagger is optional and can drift from the real API |
+| Streaming | Native, 4 shapes (§11.3) | Not native — needs SSE/WebSockets bolted on |
+| Head-of-line blocking | Solved at the HTTP layer — concurrent RPCs share one connection without blocking each other's framing | HTTP/1.1 blocks per connection — the reason browsers open 6+ parallel connections per host |
+| Deadlines/cancellation | Built into the protocol, propagates down a call chain (§11.7) | Not standardized — each hop typically applies its own unrelated timeout |
+| Browser support | Needs grpc-web + a translating proxy (§11.10) | Native, first-class |
+| Debuggability | Needs `grpcurl`/reflection — can't just eyeball it | `curl` + eyeball JSON — trivially debuggable |
+| Best fit | Internal microservice-to-microservice calls, polyglot backends, low-latency/streaming paths | Public/external APIs, third-party integrations, anything where human-readability and universal tooling matter more than raw efficiency |
+
+### 11.6 gRPC and TCP/IP — the layering, and the real advantages
+
+Mirrors the HTTP/TCP trap from [§4.3](#43-where-http-fits--the-classic-interview-trap), worth stating precisely: **gRPC is not an alternative to TCP/IP — it's built on top of it** (gRPC → HTTP/2 → TCP → IP). So "gRPC's advantages over TCP/IP" really means "what do you get from gRPC instead of hand-rolling a protocol directly on raw TCP sockets" — a fair, common interview framing, just worth naming correctly rather than comparing across layers as if they were substitutes for each other.
+
+If you built a service using nothing but raw TCP sockets, you'd have to build every one of the following yourself — gRPC gives you all of it for free:
+
+| Concern | What raw TCP gives you | What gRPC adds |
+|---|---|---|
+| Message framing | Nothing — TCP is a byte *stream*, not a message stream; you must invent your own way to know where one message ends and the next begins | HTTP/2's binary framing layer does this natively |
+| Serialization | Nothing — you choose and hand-roll your own format | Protobuf — schema-driven, compact, cross-language, with defined evolution rules (§11.4) |
+| Multiplexing many calls on one connection | Nothing — one TCP connection is one ordered byte stream; concurrent logical requests need separate connections or your own multiplexing scheme | Native — many concurrent RPCs share one HTTP/2 connection as independent streams |
+| Request/response correlation | Nothing — you'd invent your own request-ID scheme | Handled by HTTP/2 stream mechanics + the RPC call itself |
+| Streaming | Nothing built-in — you'd design your own chunking/flow-control | Native, 4 shapes (§11.3) |
+| Encryption | Nothing — TLS layered on manually | TLS on by default in gRPC's standard setup |
+| Cross-language interop | Nothing — every client/server must agree byte-for-byte on your invented format | `.proto` → codegen in ~11 official languages, guaranteed to agree because they're generated from one schema |
+| Errors, deadlines, metadata | Nothing — bytes are bytes; you define your own conventions | Standardized status codes (§11.8), deadline propagation (§11.7), a metadata/headers mechanism — consistent across every language binding |
+
+**One-sentence interview answer**: "gRPC doesn't replace TCP/IP — it sits on top of it via HTTP/2. The real comparison is gRPC vs. hand-rolling your own protocol on raw sockets, and gRPC wins there because it gives you framing, multiplexing, typed serialization, streaming, TLS, and cross-language codegen for free instead of you inventing and maintaining all of that yourself."
+
+### 11.7 Deadlines, cancellation, and interceptors
+
+- **Deadlines** are first-class: the client sets "this call must complete within N ms," sent as metadata the server can check to abandon work early if the deadline's already blown. In a call chain (service A → B → C), a well-behaved server propagates the **remaining** budget to its own downstream calls, rather than each hop starting a fresh, unrelated timeout — a real, common gap in REST systems.
+- **Cancellation**: either side can cancel an in-flight call; the other observes this and can stop work early (abort a DB query, say) instead of computing a result nobody will read.
+- **Interceptors** are gRPC's middleware — client- and server-side hooks that wrap every call, used for auth token injection, logging, metrics, retries with backoff. Structurally the same idea as Express middleware, standardized as part of the framework on both ends of the call.
+
+### 11.8 Error model
+
+gRPC has its own status-code enum — richer and more RPC-specific than HTTP's generic codes, and identical across every language binding:
+
+| Code | Meaning |
+|---|---|
+| `OK` | Success |
+| `CANCELLED` | Caller cancelled the call |
+| `DEADLINE_EXCEEDED` | Deadline (§11.7) expired before completion |
+| `INVALID_ARGUMENT` | Client sent malformed/invalid input |
+| `NOT_FOUND` | Requested entity doesn't exist |
+| `ALREADY_EXISTS` | Entity the client tried to create already exists |
+| `PERMISSION_DENIED` | Caller lacks authorization |
+| `UNAUTHENTICATED` | Caller's identity couldn't be verified |
+| `RESOURCE_EXHAUSTED` | Rate limit / quota hit |
+| `UNAVAILABLE` | Transient failure — safe to retry |
+| `INTERNAL` | Server-side bug/invariant violation |
+
+An error also carries an optional message and structured **error details** (a protobuf message of your own choosing attached to the status) — a more expressive, standardized equivalent of a REST API's ad hoc JSON error body.
+
+### 11.9 The load-balancing gotcha
+
+A genuinely common gRPC-specific interview trap: **you can't naively put gRPC behind a standard L4 (TCP-level) load balancer the way you would a REST service.**
+
+Why: gRPC's efficiency story depends on multiplexing many RPCs over one **long-lived** HTTP/2 connection. An L4 load balancer balances at the *connection* level — but a gRPC client opens one connection and keeps it open by design, so every RPC on that connection lands on the same backend forever. One busy client means one backend does all the work while its siblings sit idle — the opposite of load balancing.
+
+Standard fixes:
+- **Client-side load balancing** — the client resolves multiple backend addresses itself (DNS, or a service-mesh sidecar) and spreads calls/connections across them, rather than trusting a single L4 hop.
+- **L7 (HTTP/2-aware) proxying** — an HTTP/2-aware proxy (Envoy is the standard choice) terminates the client's connection and distributes individual **streams**, not whole connections, across backend connections — the reason service meshes (Istio, Linkerd) are largely built around Envoy.
+
+### 11.10 Browser support: grpc-web
+
+Browsers can't speak raw gRPC — `fetch`/`XHR` don't expose the low-level HTTP/2 trailer and framing control gRPC needs. The standard workaround is **grpc-web**: a JS client speaking a gRPC-compatible, browser-friendly variant, talking to a translating proxy (again, commonly Envoy) that converts to real gRPC to reach backend services. This is why gRPC is overwhelmingly a **backend-to-backend** technology in practice — public browser-facing APIs still default to REST/JSON (or GraphQL) unless a team has explicitly invested in grpc-web + a proxy.
+
+### 11.11 When to reach for gRPC — and when not to
+
+| Reach for gRPC when... | Stick with REST/JSON (or GraphQL) when... |
+|---|---|
+| Internal service-to-service calls in a polyglot microservices system — codegen keeps every language's client/server in sync with one schema | The API is public-facing / third-party-consumed, where universal tooling (`curl`, Postman, any HTTP client) and human-readability matter more than raw efficiency |
+| Low-latency, high-throughput, or high-call-volume paths, where JSON parse/payload-size cost is real | The consumer is a browser and grpc-web + a proxy isn't already set up |
+| You need native streaming (live updates, chunked uploads, chat-shaped bidirectional traffic) without bolting on WebSockets/SSE | Simplicity and debuggability matter more than performance — a small, low-traffic CRUD service gains little from gRPC's added complexity |
+| You want compile-time-checked, codegen'd contracts instead of a hand-maintained, driftable OpenAPI spec | The team/ecosystem doesn't already have protobuf tooling, and the codegen-as-a-build-step overhead isn't worth it for the workload |
+
+**A confusion worth heading off**: "why not just use gRPC instead of Kafka/RabbitMQ?" — different problem shape entirely. gRPC is **synchronous RPC**: the caller is coupled to the callee being up, reachable, and responsive right now, with no buffering, replay, or fan-out. Kafka/RabbitMQ ([§5](#5-apache-kafka--internals)/[§6](#6-rabbitmq--internals)) are **asynchronous messaging**: producer and consumer are decoupled in time, the broker durably holds the message, and (especially with Kafka) many independent consumers can each process it on their own schedule. The choice is "does the caller need an answer right now from one specific service" (gRPC) vs. "does this fact need to durably reach one or many consumers, possibly later, possibly replayed" (a broker) — not a raw performance question.
+
+### Q&A — gRPC
+
+- **"Is gRPC faster than REST just because it's binary?"** Binary/compact payloads help, but the bigger factors are usually HTTP/2 multiplexing removing per-connection overhead and avoiding JSON parse/stringify cost on high-volume paths. For a low-traffic API the raw speed gap is often not the deciding factor — weigh it against gRPC's worse browser support and debuggability before choosing on speed alone.
+- **"Why can't gRPC just run on HTTP/1.1?"** Its core mechanics — multiplexed streaming calls, and trailers used to carry the final status/metadata after a response — depend on HTTP/2 framing; HTTP/1.1 has no equivalent multiplexed-stream concept.
+- **"Does gRPC replace TCP/IP?"** No — layering trap, see §11.6. gRPC sits on HTTP/2, which sits on TCP; the meaningful comparison is gRPC vs. hand-rolling a protocol on raw sockets, not gRPC vs. TCP as if they were alternatives at the same layer.
+- **"What breaks if you put gRPC behind a naive round-robin TCP load balancer?"** Long-lived HTTP/2 connections mean every call from one client sticks to one backend — see §11.9; the fix is client-side load balancing or an HTTP/2-aware L7 proxy.
+- **"How does gRPC handle schema changes without breaking existing clients?"** Protobuf's field-number-based wire format (§11.4) makes additive changes and field renames safe by default; the one real danger is reusing a retired field number, which is why removed fields get marked `reserved`.
+
+---
+
+## 12. Consolidated quick-fire question bank
 
 A few extra rapid-fire prompts not already called out inline above, useful for a final self-drill pass:
 
@@ -1090,3 +1325,5 @@ A few extra rapid-fire prompts not already called out inline above, useful for a
 6. **"Command pattern, Strategy pattern, or Adapter pattern — which fits 'plug in a new payment provider'?"** Arguably all three have a piece: Adapter (translate to the provider's API shape), Strategy (the caller picks which provider/algorithm to use for "pay"), and if payments are queued/logged/retryable work items, Command too — a good answer names the specific responsibility each pattern is covering rather than picking just one.
 7. **"Is TCP reliable because IP is reliable?"** No — IP is unreliable/best-effort and stateless; TCP's reliability (retransmission, ordering, dedup) is built entirely at the TCP layer *on top of* an unreliable IP layer, using the connection state IP itself doesn't keep.
 8. **"Two-Phase Commit vs. Saga — which would you defend in a real interview as the better default for microservices, and why?"** Saga — 2PC's blocking/coordinator-SPOF failure modes are a poor match for microservices' independent-failure, network-partition-prone reality; Saga trades strict atomicity for eventual consistency plus explicit, idempotent compensations, which fails gracefully instead of locking up.
+9. **"Would gRPC or REST be the right call for a public API consumed by third-party developers?"** REST/JSON — universal HTTP tooling, human-readable payloads, and no need for the consumer to adopt protobuf/codegen outweigh gRPC's raw efficiency edge when the audience is external and heterogeneous ([§11.5](#115-why-grpc-beats-rest--json-for-internal-service-to-service-calls), [§11.11](#1111-when-to-reach-for-grpc--and-when-not-to)).
+10. **"You've deployed gRPC services behind a plain TCP round-robin load balancer and traffic is landing unevenly — why?"** HTTP/2 connections are long-lived and multiplexed, so an L4 balancer pins each client's entire call stream to one backend; the fix is client-side load balancing or an HTTP/2-aware L7 proxy like Envoy ([§11.9](#119-the-load-balancing-gotcha)).
