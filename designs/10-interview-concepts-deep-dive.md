@@ -808,6 +808,87 @@ This sidesteps needing a cross-instance fan-out layer (e.g., a Redis pub/sub ada
 
 **Why this stays "real-time" end to end**: nothing in this second path waits on the 15-second rollup flush or the database — detection is O(1) per message, the alert topic is small/low-volume so producer→consumer latency is milliseconds, and delivery is a direct in-memory WebSocket `emit()` once the gateway has the message. The storage path (§5.7) and the notification path (this section) share the same source topic and the same ingest consumer's read loop, but are otherwise fully independent — a slow TimescaleDB write can never delay an anomaly alert, and a burst of alerts can never stall the rollup flush.
 
+### 5.7.2 Sensor ownership: routing anomalies (and dashboard access) to the right customer
+
+Everything above treats "notify someone" and "let someone view this sensor" as if there's one undifferentiated audience. In a real multi-tenant deployment, sensors belong to customers — sensor 42's reading is only supposed to reach customer 7's dashboard and customer 7's on-call phone, not anyone else's. That requires a place that knows, authoritatively, `sensorId -> customerId`, and every path that touches a sensor's data — ingestion itself doesn't need it, but anomaly delivery and dashboard queries do — needs to consult it.
+
+**The registry itself.** This is reference/config data: low write rate (a sensor is provisioned once and rarely reassigned), high read rate (every anomaly alert and every dashboard request needs the mapping) — the opposite access pattern from the readings themselves, so it doesn't belong in TimescaleDB next to the rollups. A small relational table is enough:
+
+```sql
+CREATE TABLE sensor_registry (
+  sensor_id     TEXT PRIMARY KEY,
+  customer_id   TEXT NOT NULL,
+  registered_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX idx_sensor_registry_customer ON sensor_registry (customer_id);
+```
+
+The primary key gives O(1) `sensorId -> customerId` (what the anomaly path needs); the index gives `customerId -> sensorId[]` (what "list my sensors" on a dashboard needs).
+
+**Don't hit this table per message.** The anomaly detector runs per-message, in the hot path (§5.7.1) — a DB round-trip on every reading to resolve ownership would undo the whole point of doing detection in-process with an O(1) rolling z-score. Since registrations change rarely, keep an in-memory cache in every service that needs the mapping (the ingest consumer, the WS gateway), loaded on startup and refreshed periodically:
+
+```typescript
+const registryCache = new Map<string, string>(); // sensorId -> customerId
+
+async function refreshRegistry() {
+  const rows = await db.query("SELECT sensor_id, customer_id FROM sensor_registry");
+  registryCache.clear();
+  for (const r of rows) registryCache.set(r.sensor_id, r.customer_id);
+}
+await refreshRegistry();
+setInterval(refreshRegistry, 60_000); // registrations change rarely — a minute of staleness is fine
+```
+
+If reassignment needs to propagate faster than a minute (e.g., revoking a decommissioned sensor's access immediately), swap the poll for the same pattern used elsewhere in this doc: an outbox row (§8) written in the same transaction as the registry update, published to a small `sensor.registry.changed` topic, consumed by each cache-holder to invalidate just that one key instead of re-polling the whole table. Start with polling; only add the topic if staleness actually becomes a problem.
+
+**Path 1 — scoping anomaly alerts to the owning customer.** §5.7.1's alert payload only carried `sensorId`; add the lookup at publish time so the alert is self-contained:
+
+```typescript
+const zScore = checkAnomaly(sensorId, value);
+if (zScore !== null /* ...cooldown check as before... */) {
+  const customerId = registryCache.get(sensorId);
+  await alertProducer.send({
+    topic: "sensor.anomaly.detected",
+    messages: [{
+      key: sensorId,
+      value: JSON.stringify({ sensorId, customerId, value, zScore, ts, detectedAt: new Date().toISOString() }),
+    }],
+  });
+}
+```
+
+This one field is what turns the rest of the fan-out customer-aware instead of merely sensor-aware:
+- The **WS gateway** (§5.7.1) joins clients to a room keyed by customer, not by sensor — `customer:${customerId}` — so a client only ever receives alerts for sensors their own customer account owns, and emits using the `customerId` already on the alert instead of re-deriving it:
+  ```typescript
+  eachMessage: async ({ message }) => {
+    const alert = JSON.parse(message.value!.toString());
+    io.to(`customer:${alert.customerId}`).emit("anomaly", alert);
+  }
+  ```
+- The **Notification System** ([01-notification-system.md](01-notification-system.md)) referenced in §5.7.1 for SMS/email/push escalation needs a `customerId` to look up *whose* registered contact channels to use — a bare `sensorId` isn't something that design's recipient lookup can act on, so this field is what actually lets that integration work rather than just being a plausible-sounding arrow in a diagram.
+
+**Path 2 — authorizing dashboard access to a sensor's data.** The same registry answers "is this customer even allowed to see this sensor" for the read side (§5.7's rollup tables), which otherwise has no access control at all:
+
+```sql
+-- "give me sensor 42's last hour" — scoped to the requesting customer
+SELECT r.*
+FROM readings_1m r
+JOIN sensor_registry s ON s.sensor_id = r.sensor_id
+WHERE r.sensor_id = $1 AND s.customer_id = $2  -- $2 = authenticated customer, never client-supplied
+ORDER BY r.bucket DESC LIMIT 60;
+
+-- "what sensors does this customer even have" — populates the dashboard's sensor picker
+SELECT sensor_id FROM sensor_registry WHERE customer_id = $1;
+```
+
+The same check applies to the **live** path: when a client asks the WS gateway to subscribe to one specific sensor's room (rather than just its customer-wide alert room), the gateway checks `registryCache.get(sensorId) === client.customerId` (from the client's auth token, never a value the client sends) before allowing the `socket.join` — otherwise one customer could subscribe to another's `sensor:${sensorId}` room by guessing or enumerating IDs. The customer-scoped room from Path 1 closes this gap for anomaly alerts; this check closes the equivalent gap for direct per-sensor subscriptions.
+
+**Why the mapping lives in a registry rather than being carried on every raw reading.** It'd be simpler at first glance to just stamp `customerId` onto every message at the MQTT bridge (§5.7) and skip the registry lookup downstream entirely. Two reasons this doc doesn't do that:
+- **Reassignment.** If a sensor moves to a different customer (device resold, site decommissioned), a `customerId` baked into the raw event stream is wrong for any consumer that trusts it from then on, with no single place to correct it short of distrusting the stream. A registry lookup at read/alert time always reflects *current* ownership; a value embedded at ingest time reflects ownership *at ingest*, forever.
+- **Blast radius of a mistake.** The registry is the one place ownership can be audited, corrected, and secured independently of the high-volume telemetry pipeline — fixing a wrong `customer_id` is a one-row `UPDATE`, not a reprocessing job over a Kafka topic's retention window.
+
+This is the same "resolve by lookup against current state, don't bake it into the event" logic that shows up anywhere an authorization decision has to stay correct as ownership changes.
+
 ### Q&A — Kafka
 
 - **"What is a topic, really?"** A logical name for a stream of related messages; physically it's just a set of independently-ordered partition logs — the topic itself has no global ordering guarantee, only each partition does.
@@ -815,6 +896,8 @@ This sidesteps needing a cross-instance fan-out layer (e.g., a Redis pub/sub ada
 - **"How do consumers know where they left off?"** Committed offsets stored in the internal, replicated, compacted `__consumer_offsets` topic, keyed by group/topic/partition — see §5.4.
 - **"Can two consumers in the same group read the same partition?"** No — exactly one consumer per partition per group at a time; that's the whole parallelism model, and it caps a group's usable parallelism at the partition count.
 - **"What happens if a consumer crashes mid-processing?"** Its partitions get reassigned to other group members in a rebalance; whoever picks them up resumes from the last *committed* offset, which is why uncommitted-but-processed messages can be reprocessed (at-least-once) unless you've set up transactional exactly-once processing.
+- **"Why not just put `customerId` on every `sensor.readings` message instead of a registry?"** Because ownership can change after a reading is produced — a value baked into the raw event reflects ownership at ingest time forever, while a registry lookup at alert/read time always reflects current ownership. See §5.7.2.
+- **"How is one customer stopped from seeing another customer's sensor data or alerts?"** Two independent enforcement points, both driven by the same `sensor_registry` table: anomaly alerts are delivered to a customer-scoped room (`customer:${customerId}`) resolved from the registry at publish time rather than a sensor-scoped room anyone could join; and every dashboard read query joins against `sensor_registry` on the *authenticated* customer's ID, never one supplied by the client. See §5.7.2.
 
 ---
 
