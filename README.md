@@ -24,6 +24,16 @@ Standalone explanations of recurring interview topics — not tied to one system
 | Design | Key ideas covered |
 |---|---|
 | [Interview Concept Deep-Dives](designs/10-interview-concepts-deep-dive.md) | Atomicity/ACID, CQRS, Command vs. Strategy pattern, TCP statefulness, **Kafka internals** (partitions, throughput, offset storage), **RabbitMQ internals** (exchanges, AMQP), Kafka vs. RabbitMQ, outbox pattern, adapter pattern, plus CAP theorem, saga, circuit breaker, consistent hashing, rate limiting, single source of truth, and more |
+| [gRPC & HTTP/2 Technical Summary](designs/12-grpc-http2-technical-summary.md) | gRPC internals and how it rides on HTTP/2 |
+| [Saga Pattern In-Depth](designs/11-saga-pattern-in-depth.md) | Choreography vs. orchestration, compensating actions, idempotent steps |
+
+## Worked examples
+
+Full end-to-end examples that apply the concepts above to one concrete pipeline, kept separate so the deep-dive docs stay about the general components.
+
+| Design | Key ideas covered |
+|---|---|
+| [Sensor-Readings Pipeline](designs/13-sensor-readings-pipeline.md) | MQTT-to-Kafka edge bridge, bounded/paced/backpressured consumption, windowed rollups into TimescaleDB, real-time anomaly detection with decoupled alert fan-out, multi-tenant ownership/authorization |
 
 ## Real-world systems
 
