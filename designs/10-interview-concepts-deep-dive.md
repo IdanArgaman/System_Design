@@ -15,7 +15,8 @@
 9. [Adapter Pattern](#9-adapter-pattern)
 10. [Bonus patterns worth knowing](#10-bonus-patterns-worth-knowing)
 11. [gRPC](#11-grpc)
-12. [Consolidated quick-fire question bank](#12-consolidated-quick-fire-question-bank)
+12. [Row-Level Security (RLS)](#12-row-level-security-rls)
+13. [Consolidated quick-fire question bank](#13-consolidated-quick-fire-question-bank)
 
 ---
 
@@ -1011,7 +1012,144 @@ Browsers can't speak raw gRPC — `fetch`/`XHR` don't expose the low-level HTTP/
 
 ---
 
-## 12. Consolidated quick-fire question bank
+## 12. Row-Level Security (RLS)
+
+### 12.1 What it is
+
+**Row-Level Security (RLS)** moves access control for *which rows a query can see or modify* out of application code and into the database engine itself. Instead of every repository method remembering to add `WHERE tenant_id = :tenantId` (or `WHERE owner_id = :userId`), you attach a **policy** to the table, and the database transparently ANDs that policy's predicate into every query that touches the table — `SELECT`, `INSERT`, `UPDATE`, `DELETE` — regardless of which application, script, or human ran it.
+
+The core shift in thinking: the **table's rows aren't uniformly visible to everyone with `SELECT` privilege on the table** the way a normal GRANT works. GRANT/REVOKE controls access at the *table/column* granularity ("can this role touch this table at all"); RLS adds a second, finer dimension underneath that — "*given* this role can touch the table, which specific *rows* does it actually get."
+
+### 12.2 How it works, mechanically
+
+```mermaid
+flowchart LR
+    Q["Query:<br/>SELECT * FROM orders"] --> Planner["Query planner"]
+    Pol[("Policy on `orders`:<br/>USING (tenant_id = current_setting('app.current_tenant')::uuid)")] --> Planner
+    Planner -->|"rewrites to"| Rewritten["SELECT * FROM orders<br/>WHERE tenant_id = current_setting('app.current_tenant')::uuid"]
+    Rewritten --> Exec["Executed against the table"]
+```
+
+- **Enable RLS on a table**: `ALTER TABLE orders ENABLE ROW LEVEL SECURITY;`. The moment this runs, if **no policies exist yet**, the table becomes **default-deny** for every role except the table owner and superusers — nobody sees any rows until at least one policy grants access. This "fails closed" behavior is deliberate and worth stating explicitly in an interview: RLS is opt-in to *enable*, but once enabled, it's opt-in to *see anything at all*.
+- **A policy** (`CREATE POLICY`) is a named predicate attached to a table, scoped to a command (`SELECT`, `INSERT`, `UPDATE`, `DELETE`, or `ALL`) and a set of roles (`TO`), with two clauses:
+  - **`USING (...)`** — filters which *existing* rows are visible/affected, for `SELECT`/`UPDATE`/`DELETE`.
+  - **`WITH CHECK (...)`** — validates *new or modified* row values, for `INSERT`/`UPDATE` — this is what stops a session from writing a row that immediately falls outside its own visibility (e.g., inserting an order tagged with a different tenant's ID).
+- **Session context** is how the policy predicate knows "who is asking." Common mechanisms in Postgres:
+  - `current_setting('app.current_tenant')` — an app-defined GUC (Grand Unified Configuration variable) set per-request via `SET LOCAL app.current_tenant = '...'` inside the transaction, read back by the policy.
+  - `current_user` / `session_user` — when tenants map to actual DB roles rather than an app-level variable.
+  - A helper function wrapping a JWT claim (the pattern Supabase popularized: `auth.uid()` reads the authenticated user's ID out of the request's JWT, exposed to Postgres via a function).
+- **Multiple policies on the same command combine**: **permissive** policies (the default) OR together — satisfying *any one* is enough; **restrictive** policies (`AS RESTRICTIVE`) AND with the rest — *all* restrictive policies must pass in addition to at least one permissive one. This lets you layer a broad permissive policy with a narrower restrictive one (e.g., "tenant match" AND "not soft-deleted").
+- **Bypass paths to know cold** (a frequent interview gotcha): the table **owner** and any role with the `BYPASSRLS` attribute (superusers always have this) skip RLS entirely by default, even with policies defined — `ALTER TABLE orders FORCE ROW LEVEL SECURITY;` is required to make policies apply to the owner too. An app that connects as the table-owning role (common when the app also runs migrations) can silently have **zero** RLS protection unless `FORCE` is set.
+
+### 12.3 Advantages
+
+| Advantage | Why it matters |
+|---|---|
+| **Defense in depth** | Enforced at the data layer, so a bug in application code — a forgotten `WHERE`, a copy-pasted query missing a filter, a raw `psql` session from an engineer debugging in prod — can't leak cross-tenant/cross-user data. This is the single biggest reason teams reach for it: it converts "every query must remember to filter" into "the database refuses to hand back rows you're not entitled to, full stop." |
+| **Uniform across every access path** | The main app, a background job, a BI/reporting tool, an ORM, and a direct DB console session all get the same enforcement, because it lives in the table, not in any one client's code. |
+| **Centralizes multi-tenancy logic** | One policy replaces the same `tenant_id = ?` filter duplicated across every repository/query in the codebase — a single place to review, audit, and reason about the security boundary, instead of trusting every call site got it right. |
+| **Lets you keep a single shared schema** | Achieves strong per-tenant isolation without the operational cost of schema-per-tenant or database-per-tenant (§12.4) — one set of tables, one set of migrations, one connection pool. |
+| **Transparent to existing query code** | Application code doesn't need to change to add the filter — the database silently rewrites the query, so adding RLS to an existing table doesn't require touching every call site (only auditing that no call site was *relying* on seeing rows RLS will now hide). |
+
+### 12.4 Disadvantages
+
+| Disadvantage | Why it bites |
+|---|---|
+| **Performance risk** | The policy predicate is injected into *every* query's plan. An unindexed or expensive predicate (a subquery joining out to another table to determine access, say) silently taxes every single query against the table, and it can be non-obvious from the application code why a query got slower — you have to know to check the policy, not just the query. **Always index the columns a policy filters on** (e.g., `tenant_id`). |
+| **Invisible-failure debugging** | "Why is this query returning zero rows / missing a row" bugs are harder to diagnose than an error — RLS silently omits rows rather than raising, so a wrong policy predicate or a missing/incorrect session variable looks identical to "the data genuinely isn't there." |
+| **Bypass footguns** | Forgetting `FORCE ROW LEVEL SECURITY` for an owner-role connection, or an app accidentally connecting with a `BYPASSRLS` role, disables the protection with no error or warning — the query just works "too well." |
+| **Session-context propagation is on the app to get right** | `SET LOCAL app.current_tenant = ...` must be set correctly, every request, inside the right transaction. This gets genuinely tricky with **connection poolers in transaction-pooling mode** (e.g., PgBouncer): a connection is handed back to the pool and reused by a *different* tenant's request between transactions, so any session-scoped (not transaction-scoped) `SET` risks leaking one tenant's context into another's query — `SET LOCAL` (transaction-scoped, auto-reset at `COMMIT`/`ROLLBACK`) is the safe choice specifically because of this. |
+| **Easy to under-test locally** | If local development doesn't reliably set the session variable the way production does, policy bugs (too permissive *or* too restrictive) can go unnoticed until they hit real multi-tenant data. |
+| **Still just SQL you wrote — not a silver bullet** | A wrong or incomplete predicate is a real security hole, exactly like a wrong app-level filter — RLS relocates *where* the check lives, it doesn't make the check itself automatically correct. |
+| **Not portable / not universal** | Native RLS is a Postgres/Oracle/SQL Server/Snowflake-class feature; MySQL has no native equivalent (workarounds via views or app-level filtering only) — a real constraint if the stack might need to support multiple database engines. |
+
+### 12.5 What can be used instead
+
+| Alternative | Trade-off vs. RLS |
+|---|---|
+| **Application-level filtering** (explicit `WHERE tenant_id = ?` in every query, or enforced via a scoped repository/ORM base class) | Simplest, most portable, no DB-specific feature needed — but relies entirely on every developer and every call site getting it right, forever; a single missed filter is a real vulnerability, and there's no floor underneath application code the way RLS provides. |
+| **Schema-per-tenant** (each tenant gets its own Postgres schema; app switches `search_path` per request) | Stronger physical isolation than RLS (a bug can't cross schema boundaries), and simpler mental model per-tenant — but doesn't scale well past low thousands of tenants (migrations must run per-schema, connection/catalog overhead grows), a real operational tax RLS avoids by keeping one shared schema. |
+| **Database-per-tenant** | Strongest isolation available (separate backup/restore, separate blast radius, easiest to satisfy strict data-residency requirements) — highest operational cost: N databases to provision, migrate, monitor, and scale independently. Common for enterprise/regulated tenants specifically because of that isolation guarantee. |
+| **Security-barrier views** (`CREATE VIEW tenant_orders WITH (security_barrier) AS SELECT * FROM orders WHERE tenant_id = current_setting(...)`, then grant access to the view instead of the base table) | Conceptually similar filtering, no RLS-specific feature required (works even on engines without native RLS) — but every consumer must know to query the view, not the table (nothing stops a direct table query from bypassing it), and it's less flexible for policies that vary by command (`SELECT` vs. `INSERT` need different views/rules). |
+| **Policy-engine / ABAC at the app or gateway layer** (e.g., Open Policy Agent evaluating richer business rules than "tenant_id equals X" — role hierarchies, resource attributes, time-of-day, etc.) | Handles authorization logic far more complex than row-equality checks, and is DB-engine-agnostic — but adds a network hop, doesn't protect direct DB access the way RLS does, and is a heavier tool than most row-isolation problems actually need. |
+
+**How to decide in an interview**: "does a bug in my application code, or someone with direct DB access, have the ability to see another tenant's/user's rows?" — if the honest answer is "yes, if they forget the filter," that's the gap RLS specifically closes. If the isolation requirement is regulatory/contractual (a tenant demanding provably separate storage), schema- or database-per-tenant is the stronger claim to make, RLS or not.
+
+### 12.6 Postgres code example
+
+A multi-tenant `orders` table, isolated by `tenant_id`, with the session's tenant supplied via a GUC set per-transaction:
+
+```sql
+-- 1. Table + the index the policy predicate will actually use
+CREATE TABLE orders (
+    id          bigserial PRIMARY KEY,
+    tenant_id   uuid NOT NULL,
+    customer    text NOT NULL,
+    amount      numeric(10,2) NOT NULL,
+    created_at  timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX orders_tenant_id_idx ON orders (tenant_id);
+
+-- 2. Turn RLS on, and force it to apply even to the table owner
+ALTER TABLE orders ENABLE ROW LEVEL SECURITY;
+ALTER TABLE orders FORCE ROW LEVEL SECURITY;
+
+-- 3. One policy covering all commands: readers only see their tenant's rows,
+--    writers can only write rows tagged with their own tenant
+CREATE POLICY tenant_isolation ON orders
+    FOR ALL
+    USING     (tenant_id = current_setting('app.current_tenant')::uuid)
+    WITH CHECK (tenant_id = current_setting('app.current_tenant')::uuid);
+
+-- 4. Per request, the app sets the tenant for the current transaction only
+BEGIN;
+SET LOCAL app.current_tenant = '11111111-1111-1111-1111-111111111111';
+
+SELECT * FROM orders;                                   -- only tenant 111...'s rows come back
+
+INSERT INTO orders (tenant_id, customer, amount)
+VALUES ('11111111-1111-1111-1111-111111111111', 'Acme', 42.00);   -- OK — matches session tenant
+
+INSERT INTO orders (tenant_id, customer, amount)
+VALUES ('22222222-2222-2222-2222-222222222222', 'Other', 10.00);  -- ERROR: new row violates WITH CHECK
+COMMIT;
+```
+
+`SET LOCAL` (not plain `SET`) is deliberate: it resets automatically at `COMMIT`/`ROLLBACK`, which is exactly the safety property you need when connections are reused across requests/tenants by a pooler (§12.4).
+
+A second, common shape — **row ownership by the authenticated user** rather than a tenant, the pattern used by Supabase-style apps where a JWT claim is exposed to Postgres as a function:
+
+```sql
+CREATE POLICY owns_row ON documents
+    FOR ALL
+    USING     (owner_id = auth.uid())
+    WITH CHECK (owner_id = auth.uid());
+```
+
+And a **restrictive policy layered on top of a permissive one** — tenant match is still required, *and* soft-deleted rows are hidden from everyone regardless of tenant:
+
+```sql
+CREATE POLICY tenant_isolation ON orders
+    FOR ALL
+    USING (tenant_id = current_setting('app.current_tenant')::uuid);
+
+CREATE POLICY hide_deleted ON orders
+    AS RESTRICTIVE
+    FOR SELECT
+    USING (deleted_at IS NULL);
+```
+
+### Q&A — Row-Level Security
+
+- **"If I `ENABLE ROW LEVEL SECURITY` on a table but define no policies, what happens?"** Default-deny — no role except the table owner and superusers sees any rows at all, until at least one policy is created. This trips people up because it's the opposite of most opt-in features: enabling RLS *removes* access first, policies *add it back*.
+- **"Does RLS protect against a compromised application server?"** Only as much as the credentials it's using allow — if the app connects as a role without `BYPASSRLS` and the table isn't owned by that role (or `FORCE ROW LEVEL SECURITY` is set), a compromised app is still bound by the policy just like a normal user session; if the app connects as the table owner without `FORCE`, RLS gives it nothing.
+- **"Why does connection pooling make RLS harder?"** Pooling in transaction mode hands the same physical connection to different logical sessions between transactions — if tenant context were set with plain `SET` (session-scoped) instead of `SET LOCAL` (transaction-scoped), one tenant's context could leak into the next request reusing that connection.
+- **"RLS vs. schema-per-tenant — how do you choose?"** RLS keeps one schema/one set of migrations and is cheaper to operate at high tenant counts, but its isolation is "as strong as your predicate and your session-context plumbing"; schema- or database-per-tenant costs more operationally but gives isolation that doesn't depend on a query predicate being correct — reach for it when the isolation requirement is contractual/regulatory, not just "don't leak data by accident."
+- **"What's the actual mechanism — does Postgres filter rows after fetching them, or before?"** Before, conceptually — the planner rewrites the query to AND the policy predicate into the `WHERE` clause (and folds it into `INSERT`/`UPDATE` checks), so it participates in normal query planning and *can* use an index on the predicated column, which is exactly why indexing what a policy filters on matters (§12.4).
+
+---
+
+## 13. Consolidated quick-fire question bank
 
 A few extra rapid-fire prompts not already called out inline above, useful for a final self-drill pass:
 
