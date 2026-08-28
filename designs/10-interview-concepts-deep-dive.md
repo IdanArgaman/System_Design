@@ -16,7 +16,8 @@
 10. [Bonus patterns worth knowing](#10-bonus-patterns-worth-knowing)
 11. [gRPC](#11-grpc)
 12. [Row-Level Security (RLS)](#12-row-level-security-rls)
-13. [Consolidated quick-fire question bank](#13-consolidated-quick-fire-question-bank)
+13. [Load Balancers](#13-load-balancers)
+14. [Consolidated quick-fire question bank](#14-consolidated-quick-fire-question-bank)
 
 ---
 
@@ -1149,7 +1150,185 @@ CREATE POLICY hide_deleted ON orders
 
 ---
 
-## 13. Consolidated quick-fire question bank
+## 13. Load Balancers
+
+### 13.1 What a load balancer does, and why it exists
+
+A **load balancer (LB)** sits between clients and a pool of backend instances, distributing incoming traffic across that pool so that no single instance is overwhelmed while others sit idle. It's the piece that turns "one server" into "a horizontally-scalable fleet that looks like one address" from the outside.
+
+Beyond raw distribution, a load balancer typically also owns:
+- **Failover** — stop sending traffic to instances that are unhealthy (§13.5), so a client never has to know or care that a backend died.
+- **A single stable entry point** — clients/DNS point at the LB's address, not at individual, churning backend instances (which get added, removed, rescheduled by an orchestrator, etc.).
+- Often, **TLS termination**, request-level observability (one place to log/metric every request), and sometimes content-based routing (§13.3).
+
+### 13.2 The L4 vs. L7 split
+
+This is the single most important axis to be precise about in an interview — the same "load balancer" word covers two genuinely different mechanisms depending on which OSI layer it operates at.
+
+| | **L4 (Transport layer)** | **L7 (Application layer)** |
+|---|---|---|
+| **What it looks at** | IP address + port only — the TCP/UDP header. Never inspects payload. | The actual HTTP request — method, path, headers, cookies, host, body. |
+| **How it decides where to route** | Per-**connection**: once a TCP connection is opened, every packet on it goes to the same backend for the life of the connection. | Per-**request**: can route `/api/*` to one pool and `/static/*` to another, even across requests multiplexed on the same underlying connection (relevant for HTTP/2 — see §13.7's gRPC case). |
+| **Protocol awareness** | None — works for any TCP/UDP traffic (HTTP, gRPC, raw databases, custom protocols). | HTTP/HTTP(S)-aware only (some also speak gRPC/WebSocket explicitly). |
+| **Performance** | Very fast — no payload parsing, minimal per-packet overhead. | Slower per-request (must parse/inspect the request), but usually negligible at typical scale. |
+| **Can it terminate TLS / do content-based routing?** | No (a pure L4 LB just forwards encrypted bytes — TLS *passthrough*, §13.8). | Yes — this is exactly where TLS termination, path/host-based routing, header rewriting, and WAF-style inspection live. |
+| **Examples** | AWS Network Load Balancer (NLB), LVS/IPVS, HAProxy in `mode tcp`, F5 hardware appliances, plain `iptables`/DNAT-based LBs. | AWS Application Load Balancer (ALB), nginx, HAProxy in `mode http`, Envoy, most API gateways. |
+
+**The one-sentence framing for an interview**: "L4 balances *connections* based on network-layer info alone and doesn't care what's inside the packets; L7 balances *requests* based on actually understanding the application protocol, which is what unlocks content-based routing and TLS termination but costs more CPU per request."
+
+### 13.3 Types, by deployment shape
+
+Beyond the L4/L7 axis (which is about *what a single hop inspects*), load balancers also differ in *where and how they sit* in the architecture:
+
+| Type | How it works | Typical use |
+|---|---|---|
+| **DNS-based (GSLB)** | The DNS server returns different IPs to different clients/regions — round-robin, geo-based, or latency-based — instead of a single IP always answering. | Routing traffic to the **nearest healthy region/datacenter** at a global scale (a form of load balancing before a single packet is even sent). Coarse-grained: DNS record TTLs mean stale entries linger in resolver caches, so failover isn't instant. |
+| **Hardware appliance** | A dedicated physical device (F5 BIG-IP, Citrix ADC) doing L4/L7 balancing, often with custom ASICs for line-rate throughput. | Large enterprise/on-prem data centers with heavy sustained throughput and budget for dedicated hardware; increasingly displaced by software/cloud LBs. |
+| **Software LB (self-hosted)** | A process on commodity servers/VMs — nginx, HAProxy, Envoy — doing L4 or L7 balancing in software. | The common default for self-managed infrastructure; flexible, scriptable, cheap to run in containers, easy to version-control config. |
+| **Cloud-managed LB** | A managed service (AWS ALB/NLB/GWLB, GCP Cloud Load Balancing, Azure Load Balancer) — the provider runs and scales the LB tier for you. | The default choice in cloud-native architectures — no LB-fleet-of-its-own to operate, scales automatically, integrates with the provider's health checks/autoscaling/DNS. |
+| **Client-side load balancing** | The **client itself** holds the list of backend addresses (via DNS, a service registry, or a service-mesh control plane) and picks one directly — no LB hop in the network path at all. | Internal service-to-service calls where an extra network hop is wasteful, and especially where a single L4 hop would misbehave — this is exactly the gRPC-behind-an-L4-balancer fix from [§11.9](#119-the-load-balancing-gotcha). |
+| **Sidecar / service mesh proxy** | Every service instance runs a local proxy (Envoy is the standard choice) that every outbound call goes through first; the proxy handles LB, retries, circuit breaking, and mTLS to the real destination, chosen via the mesh's service discovery. | Polyglot microservice fleets (Istio, Linkerd) wanting consistent L7 traffic policy (LB algorithm, retries, timeouts, canary %-based routing) enforced uniformly without every service reimplementing it in its own language/library. |
+
+```mermaid
+flowchart TB
+    subgraph Global["Global tier — DNS/GSLB"]
+    DNS["DNS / GSLB<br/>routes by geography or latency"]
+    end
+    DNS --> RegionUS["US region LB (L7)"]
+    DNS --> RegionEU["EU region LB (L7)"]
+
+    subgraph US["US region"]
+    RegionUS --> S1["Service A instance 1"]
+    RegionUS --> S2["Service A instance 2"]
+    end
+
+    subgraph EU["EU region"]
+    RegionEU --> S3["Service A instance 1"]
+    RegionEU --> S4["Service A instance 2"]
+    end
+
+    S1 -.->|"internal call,<br/>client-side LB / mesh sidecar"| S5["Service B instance 1"]
+    S1 -.-> S6["Service B instance 2"]
+```
+
+### 13.4 Load balancing algorithms
+
+| Algorithm | How it picks | Best fit / caveat |
+|---|---|---|
+| **Round robin** | Cycle through backends in order, one request each. | Simple, works well when every backend has roughly equal capacity and requests are roughly equal cost. |
+| **Weighted round robin** | Same as round robin, but backends with a higher weight get proportionally more requests. | Heterogeneous backend capacity (some instances are bigger/faster) or gradual canary rollout (send a new version 5% of traffic). |
+| **Least connections** | Route to whichever backend currently has the fewest active connections. | Long-lived or variable-duration connections/requests, where round robin can pile up slow requests on one instance while others sit idle. |
+| **Weighted least connections** | Least connections, adjusted by a capacity weight. | Same as above, plus heterogeneous backend sizing. |
+| **IP hash / source hash** | Hash the client's IP (or another key) to deterministically pick the same backend every time. | **Session affinity** ("sticky sessions") without a shared session store — the same client always lands on the same instance holding its in-memory session state. Trade-off: uneven load if client IPs aren't uniformly distributed, and losing that one backend loses its "stuck" clients' state. |
+| **Least response time** | Route to the backend with the lowest observed latency (and/or fewest active connections). | Backends with meaningfully different processing times, where you want to actively favor whoever's fastest *right now*, not just least loaded. |
+| **Random / power-of-two-choices** | Pick 2 backends at random, send to whichever has fewer active connections. | Scales better than pure least-connections at very high request rates (avoids every LB instance needing perfectly synchronized global connection counts) while still avoiding round robin's blindness to load. |
+| **Consistent hashing** | See [§10.5](#105-consistent-hashing) — places backends and keys on a hash ring so only a small fraction of traffic remaps when a backend is added/removed. | Distributed caches or sharded backends where **which backend owns a given key** matters for cache-hit rate (e.g., routing by user ID to keep that user's data warm on one node), not just "any backend will do." |
+
+**Session affinity, called out explicitly**: several use cases above ("sticky sessions" via IP hash, or a cookie-based affinity an L7 LB can also do by inspecting a session cookie) trade off **even load distribution** for **state locality**. The generally preferred fix where possible is to make backends stateless (push session state to a shared store — Redis, a DB) so *any* algorithm works cleanly; reach for affinity when that's not achievable in the time you have.
+
+### 13.5 Health checks
+
+A load balancer is only as good as its view of which backends are actually alive:
+
+- **Active health checks**: the LB itself periodically probes each backend (`GET /health`, or a TCP connect) on a fixed interval, independent of real traffic, and removes a backend from rotation after N consecutive failures (and re-adds it after N consecutive successes — often with different thresholds for "mark down" vs. "mark up," to avoid flapping).
+- **Passive health checks**: the LB observes *real* traffic — a backend returning a run of 5xxs or timing out gets ejected without needing a dedicated probe. Cheaper (no extra probe traffic) but slower to detect a backend that's failing before it receives live traffic.
+- Real systems commonly run **both**: active checks for fast, traffic-independent detection, passive checks/circuit-breaking as a backstop against a backend that passes its health endpoint but still fails real requests (see the Circuit Breaker pattern, [§10.3](#103-circuit-breaker), which is the same idea applied from the *caller's* side rather than the LB's).
+
+### 13.6 SSL/TLS handling
+
+| Mode | How it works | Trade-off |
+|---|---|---|
+| **TLS termination** | The LB decrypts incoming TLS, then talks **plaintext** (or a separate, often simpler, internal TLS) to backends. | Backends are simpler (no cert management), and the LB is the one place doing the (CPU-costly) decryption — but traffic between LB and backend is unencrypted unless a second TLS hop is added, which matters if that network segment isn't trusted. |
+| **TLS passthrough** | The LB forwards encrypted bytes untouched (this is inherently an **L4** behavior — the LB can't be L7-aware here since it can't read the encrypted request) — the backend itself terminates TLS. | End-to-end encryption all the way to the backend, but the LB can't do any content-based (L7) routing, since it never sees the plaintext request. |
+| **TLS re-encryption ("bridging")** | The LB terminates the client's TLS connection, then opens a **new**, separate TLS connection to the backend. | Gets both L7 routing *and* encryption on both hops, at the cost of double TLS handshake overhead and needing valid certs/trust on both sides. |
+
+### 13.7 Which type fits which scenario
+
+| Scenario | Reach for | Why |
+|---|---|---|
+| Public-facing web app needing path/host-based routing, cookie-based session affinity, WAF rules, TLS termination | **L7** (ALB, nginx, Envoy) | Needs to understand the HTTP request itself to route/rewrite/inspect it. |
+| Extreme-low-latency or very high-throughput passthrough traffic (gaming servers, video streaming, arbitrary TCP/UDP protocols) | **L4** (NLB, HAProxy `mode tcp`) | No payload parsing overhead; protocol-agnostic; handles non-HTTP protocols an L7 LB can't understand at all. |
+| Non-HTTP protocols in general (raw databases, custom binary TCP protocols, DNS, SMTP) | **L4** | L7 LBs are HTTP(S)-specific by construction — there's often no other option. |
+| gRPC / any long-lived multiplexed HTTP/2 traffic | **L7, HTTP/2-aware** (Envoy) — explicitly *not* a plain L4/round-robin setup | An L4 LB balances whole *connections*; gRPC's HTTP/2 connections are long-lived, so all of one client's calls stick to one backend — the exact gotcha detailed in [§11.9](#119-the-load-balancing-gotcha). |
+| Global traffic across multiple regions/datacenters, disaster-recovery failover | **DNS-based / GSLB**, often layered above a regional L7 LB | Needs to steer clients to an entire *region*, before any single LB instance is even reachable — not something an in-region L4/L7 LB can do by itself. |
+| Internal service-to-service calls in a polyglot microservice mesh needing consistent retries/timeouts/canary routing | **Sidecar / service mesh** (Envoy via Istio/Linkerd) | Centralizes L7 traffic policy outside each service's own code, uniformly across every language in the mesh. |
+| A single internal client needing to talk to a known, small set of backend replicas with minimal latency overhead | **Client-side load balancing** | Skips an extra network hop entirely — appropriate when the client can reasonably keep track of backend addresses itself (via DNS SRV records or a service registry). |
+| A CDN/edge cache choosing which origin server owns a given cache key | **Consistent hashing** ([§10.5](#105-consistent-hashing)) applied as the LB algorithm | Cache-hit rate depends on the *same* key consistently landing on the *same* backend, not just "any healthy backend." |
+
+### 13.8 Keeping the load balancer itself highly available
+
+A load balancer that's a single point of failure just moves the SPOF problem one hop earlier — so the LB tier itself needs redundancy:
+
+```mermaid
+flowchart LR
+    subgraph HA["Active-passive LB pair"]
+    VIP(("Floating/Virtual IP"))
+    LB1["LB instance A (active)"]
+    LB2["LB instance B (passive, standby)"]
+    VIP -.->|"currently bound to"| LB1
+    LB1 <-.->|"heartbeat (VRRP/keepalived)"| LB2
+    end
+    Client["Clients"] --> VIP
+    VIP -->|"failover if A stops<br/>responding to heartbeat"| LB2
+```
+
+- **Active-passive with a floating/virtual IP**: two (or more) LB instances share a virtual IP via a protocol like **VRRP** (`keepalived` is the common Linux implementation) — one holds the IP and serves traffic, the other watches via heartbeat and takes over the IP if the active one stops responding.
+- **Anycast**: the same IP address is announced from multiple physical locations via BGP; network routing itself sends each client to the topologically-nearest instance answering that IP, and withdrawing the announcement from a failed location automatically reroutes clients elsewhere — this is how many CDNs and DDoS-scrubbing services achieve both global load distribution and failover in one mechanism.
+- **DNS-based failover**: health-checked DNS records (e.g., Route 53 health checks) stop returning an unhealthy region's IP — coarser and slower (DNS TTL/caching delay) than the two mechanisms above, but simple and works across arbitrary distances.
+- **Cloud-managed LBs sidestep this entirely** — AWS ALB/NLB, GCP's load balancers, etc. are themselves distributed, multi-AZ services with HA built in, which is a real, concrete reason teams choose them over self-hosting nginx/HAProxy: the "who load-balances the load balancer" problem is the provider's to solve, not yours.
+
+### 13.9 Config examples
+
+An **L7** example — nginx routing by path, with weighted backends and passive health checks (`max_fails`/`fail_timeout`):
+
+```nginx
+upstream api_backend {
+    least_conn;
+    server 10.0.1.10:8080 weight=3;
+    server 10.0.1.11:8080 weight=1;
+    server 10.0.1.12:8080 max_fails=3 fail_timeout=30s;
+}
+
+server {
+    listen 443 ssl;                 # TLS terminates here
+    location /api/ {
+        proxy_pass http://api_backend;
+    }
+    location /static/ {
+        proxy_pass http://static_backend;   # different pool, routed by path
+    }
+}
+```
+
+An **L4** example — HAProxy in raw TCP mode, no payload inspection, protocol-agnostic:
+
+```haproxy
+frontend tcp_front
+    bind *:5432
+    mode tcp
+    default_backend postgres_replicas
+
+backend postgres_replicas
+    mode tcp
+    balance leastconn
+    option tcp-check
+    server pg1 10.0.2.10:5432 check
+    server pg2 10.0.2.11:5432 check
+```
+
+Note the qualitative difference: the nginx config talks about paths and TLS (it understands HTTP); the HAProxy TCP config only ever mentions IPs, ports, and a health check — it would balance Postgres connections exactly the same way it'd balance any other TCP protocol.
+
+### Q&A — Load Balancers
+
+- **"L4 or L7 for a public API gateway that needs to terminate TLS and route `/v1/*` vs `/v2/*` to different backend fleets?"** L7 — TLS termination and path-based routing both require understanding the HTTP request, which is precisely what an L4 LB, by definition, doesn't look at.
+- **"Why can't you just round-robin gRPC traffic across an L4 load balancer?"** Because gRPC's HTTP/2 connections are long-lived and multiplexed — an L4 LB balances at the connection level, so every call from one client sticks to whichever backend got the connection, starving the rest; see [§11.9](#119-the-load-balancing-gotcha) for the fix (client-side LB or an HTTP/2-aware L7 proxy).
+- **"How is 'session affinity' at the load balancer different from just storing sessions in Redis?"** Affinity (IP hash, cookie-based) is a workaround that keeps a client pinned to whichever backend happens to hold its in-memory state — it works, but it's fragile (losing that backend loses the session, and load can skew). A shared session store removes the need for affinity entirely by making every backend interchangeable — generally the more robust design when you can afford the extra hop to the store.
+- **"What's the difference between active and passive health checks, and why have both?"** Active checks are the LB proactively probing a dedicated endpoint on a timer; passive checks are the LB inferring health from real traffic outcomes (errors/timeouts). Active checks catch a dead backend before it gets live traffic; passive checks catch a backend that *passes* its health endpoint but still fails real requests — together they cover each other's blind spot.
+- **"Doesn't the load balancer become the new single point of failure once you've solved it for the backends?"** Yes, unless you make the LB tier itself redundant — active-passive with a floating IP (VRRP/keepalived), anycast announced from multiple locations, or DNS-based failover; see §13.8. This is also why most teams default to a cloud-managed LB (ALB/NLB/GCLB) rather than self-hosting one — the provider has already solved this.
+
+---
+
+## 14. Consolidated quick-fire question bank
 
 A few extra rapid-fire prompts not already called out inline above, useful for a final self-drill pass:
 
