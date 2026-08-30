@@ -155,6 +155,58 @@ Generating globally unique 64-bit integer IDs without lock contention or cross-n
 * **Pros**: Zero cross-node communication; k-sortable by creation time; high throughput (up to 4.096 million IDs/sec/node).
 * **Cons**: Highly sensitive to System Clock Drift (NTP synchronization issues can halt generation or cause duplicate IDs if fallback isn't configured properly). Base62 encoded string length varies over time.
 
+#### Why Clock Drift Is Dangerous: Duplicate IDs
+
+A Snowflake ID is only unique because `(timestamp, worker_id, sequence)` is assumed to always increase. That assumption breaks the moment a machine's wall clock moves **backward** — which NTP does routinely via a "step" correction (as opposed to a gradual "slew") when drift exceeds a threshold. If the generator blindly trusts `System.currentTimeMillis()`, it can replay a `(timestamp, worker_id, sequence)` triple it already issued minutes earlier, minting the exact same 64-bit ID — and therefore the same short code — for a second, completely different URL:
+
+```mermaid
+sequenceDiagram
+    participant NTP as NTP Daemon
+    participant Clock as Worker #7 Wall Clock
+    participant Gen as Snowflake Generator
+    participant DB as Cassandra
+
+    Note over Clock: t = 950 ms
+    Gen->>Clock: read time()
+    Clock-->>Gen: 950
+    Gen->>Gen: ID = (950<<22) | (7<<12) | 0
+    Gen->>DB: INSERT short_code = base62(ID)
+    DB-->>Gen: OK — "aB7x9" -> longurl.com/alpha
+
+    Note over Clock: t advances normally to 1000 ms
+    Gen->>Clock: read time()
+    Clock-->>Gen: 1000
+    Gen->>Gen: ID = (1000<<22) | (7<<12) | 0
+    Gen->>DB: INSERT short_code = base62(ID)
+    DB-->>Gen: OK — "cD9z2" -> longurl.com/beta
+
+    Note over NTP,Clock: NTP detects drift, STEPS clock backward 50ms
+    NTP->>Clock: set time = 950 ms
+    Gen->>Clock: read time()
+    Clock-->>Gen: 950  (seen before!)
+    Gen->>Gen: ID = (950<<22) | (7<<12) | 0  -- identical to the first ID
+    Gen->>DB: INSERT short_code = base62(ID)
+    DB-->>Gen: COLLISION — "aB7x9" silently overwritten to point at longurl.com/gamma
+```
+
+The generator has no way to tell "the clock rolled back" from "time legitimately reached 950ms again" — both look identical from inside the process. The two standard fixes are:
+* **Halt-on-rollback**: refuse to mint IDs whenever `now < last_seen_timestamp`, and block until the clock catches back up. Safe, but turns a clock hiccup into a write-path outage.
+* **Monotonic clock + rollback buffer**: source time from a monotonic clock (immune to NTP steps) and reject/alert on any observed backward jump, rather than trusting wall-clock reads directly.
+
+Both add operational complexity that the Range-Based Token Service (Strategy C) simply doesn't need, since it never reads the system clock at all.
+
+#### Why Encoded Length Drifts: The Timestamp Keeps Growing
+
+Because the 41-bit timestamp occupies the *most significant* bits of the ID, the raw integer — and therefore its Base62 encoding — grows almost monotonically with wall-clock time. Early IDs are numerically tiny; IDs minted years later are numerically enormous. Unlike the Range-Based Token Service (which mints dense, roughly-fixed-length integers), Snowflake's short codes literally get longer as the service ages:
+
+| Time Since Custom Epoch | Approx. Minimum ID (`worker=0, seq=0`) | Base62 Length |
+| :--- | :--- | :--- |
+| Day 1 (epoch start) | $\approx 0$ | 1 character |
+| 1 year in | $\approx 1.32 \times 10^{17}$ | 10 characters |
+| 10 years in | $\approx 1.32 \times 10^{18}$ | 11 characters |
+
+This is a problem for a URL shortener specifically because Section 2.1's entire capacity model assumes a **fixed** 7-character short code. A scheme whose encoded length keeps climbing forces an uncomfortable choice: left-pad every code to a fixed maximum width (wasting bytes on early, small IDs) or accept variable-length short URLs (complicating routing, indexing, and the "short" in "short URL"). Range-based allocation avoids this entirely because sequential integers stay densely packed within a predictable digit range for the whole 10-year retention window.
+
 ### Strategy C: Range-Based Token Service (Recommended Architecture)
 * **Mechanism**: A centralized, lightweight Token Service manages token ranges stored in a relational database table:
 
