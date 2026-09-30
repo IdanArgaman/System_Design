@@ -26,6 +26,7 @@ Standalone explanations of recurring interview topics — not tied to one system
 | [Interview Concept Deep-Dives](designs/10-interview-concepts-deep-dive.md) | Atomicity/ACID, CQRS, Command vs. Strategy pattern, TCP statefulness, **Kafka internals** (partitions, throughput, offset storage), **RabbitMQ internals** (exchanges, AMQP), Kafka vs. RabbitMQ, outbox pattern, adapter pattern, plus CAP theorem, saga, circuit breaker, consistent hashing, rate limiting, single source of truth, and more |
 | [gRPC & HTTP/2 Technical Summary](designs/12-grpc-http2-technical-summary.md) | gRPC internals and how it rides on HTTP/2 |
 | [Saga Pattern In-Depth](designs/11-saga-pattern-in-depth.md) | Choreography vs. orchestration, compensating actions, idempotent steps |
+| [Order Idempotency & Inventory Concurrency](concepts/11-order-concurrency-idempotency.md) | Two-phase idempotency keys (lease + fencing token, payload fingerprint, response replay), conditional UPDATE vs. `FOR UPDATE` vs. optimistic vs. `SERIALIZABLE`, deadlock-free multi-item orders, flash-sale hot rows, payment saga — 9 Mermaid flows |
 | [Change Tracking / Audit Log](concepts/10-change-tracking-audit-log.md) | `AsyncLocalStorage` context propagation, Prisma extension (with 12 fixes to a naive version), Postgres trigger + `set_config`, outbox, CDC, Mongoose plugin, retention/immutability |
 
 ## Worked examples
