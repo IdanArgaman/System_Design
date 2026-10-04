@@ -14,6 +14,7 @@ Interview-ready system design write-ups, converted and expanded from `System Des
 | 6 | [ETL vs ELT & Streaming Pipelines](designs/06-etl-elt-data-pipeline.md) | Decision framework, corrects JDBC polling vs. true CDC, columnar storage rationale |
 | 7 | [Airflow-style Task Scheduler](designs/07-airflow-task-scheduler.md) | Adds the missing Triggerer and DAG File Processor, Celery vs. Kubernetes executor trade-off |
 | 8 | [Real-Time Price Feed](designs/08-realtime-price-feed.md) | **Fixes a missing OHLC field** and a cache-key design flaw, consistent-hash fan-out, backpressure |
+| 12 | [Rate Limiter](designs/12-rate-limiter.md) | Core counting logic for fixed window, sliding log, sliding window counter, token bucket, leaky bucket (queue + meter), GCRA and concurrency limiting — each in TypeScript and atomic Redis Lua; distributed concerns (atomicity, Redis `TIME`, token leasing, fail-open vs. fail-closed, multi-region), 429/`Retry-After` contract |
 
 Original source: [`System Design and Architecture.pptx`](System%20Design%20and%20Architecture.pptx).
 
